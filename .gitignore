@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.eggs/
+
+# Virtual environment — never commit this
+rl_venv/
+
+# Training outputs
+logs/
+models/
+outputs/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
