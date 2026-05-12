@@ -1,0 +1,587 @@
+% ============================================================
+%  IEEE-Style Project Report — SO-100 Robot Arm RL
+%  Compile with:  pdflatex report.tex  (run twice for references)
+%  Or:            latexmk -pdf report.tex
+% ============================================================
+
+\documentclass[conference]{IEEEtran}
+
+% ── Packages ────────────────────────────────────────────────
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{cite}                  % IEEE-style numbered citations [1]
+\usepackage{amsmath,amssymb}       % math symbols and equations
+\usepackage{graphicx}              % \includegraphics
+\usepackage{booktabs}              % professional tables (\toprule etc.)
+\usepackage{array}                 % extended column definitions in tables
+\usepackage{tabularx}              % tables that fill text width
+\usepackage{xcolor}                % colored text (optional)
+\usepackage{url}                   % \url{} for links
+\usepackage{hyperref}              % clickable links in PDF
+\usepackage{caption}               % fine-grained caption control
+\usepackage{subcaption}            % side-by-side figures with sub-captions
+\usepackage{microtype}             % better text justification
+
+% ── Page numbering ──────────────────────────────────────────
+% IEEEtran suppresses page numbers by default; restore them here
+\pagestyle{plain}                  % page number centred at bottom
+
+% ── Hyperref setup ──────────────────────────────────────────
+\hypersetup{
+    colorlinks = true,
+    linkcolor  = black,
+    citecolor  = black,
+    urlcolor   = blue,
+    pdftitle   = {Reinforcement Learning for SO-100 Robot Arm Manipulation},
+    pdfauthor  = {Your Name},
+}
+
+
+% ── Custom commands (add your own as needed) ─────────────────
+\newcommand{\todo}[1]{\textcolor{red}{[TODO: #1]}}  % red TODO markers
+
+
+% ============================================================
+%  TITLE & AUTHORS
+% ============================================================
+\begin{document}
+
+\title{Reinforcement Learning for Robotic Manipulation:\\
+       Training the SO-100 Arm to Touch and Place Objects}
+
+\author{
+    \IEEEauthorblockN{Your Full Name}
+    \IEEEauthorblockA{
+        Department of \todo{Your Department}\\
+        \todo{Your University}\\
+        \todo{your.email@university.edu}
+    }
+}
+
+\maketitle
+
+% ── Running footer note (optional) ──────────────────────────
+\begin{abstract}
+%% ── ABSTRACT ──────────────────────────────────────────────
+%%  150–250 words. State: what you did, how, key results.
+%%  Do NOT cite references in the abstract.
+
+This paper presents the design, implementation, and evaluation of a
+reinforcement learning (RL) system for controlling the SO-100, a six
+degree-of-freedom robotic arm, in a simulated MuJoCo environment.
+The objective is to train an autonomous agent—using the Soft
+Actor-Critic (SAC) algorithm—to perform manipulation tasks of
+increasing difficulty, starting with touching a target cube and
+progressing toward pick-and-place operations.
+The environment is built on top of the \texttt{gym-so100} package,
+which wraps dm\_control physics into a Gymnasium-compatible interface.
+Three task variants are defined: dense-reward touch, sparse-reward
+touch, and cube-to-bin placement.
+A 12-dimensional state observation is used, comprising object
+positions and joint angles.
+Training is conducted for 300\,000 environment steps using
+parallel vectorized environments and observation normalisation.
+Results show that the agent successfully learns an approach
+strategy—reducing end-effector-to-cube distance from over 0.18~m to
+under 0.03~m—but does not yet achieve reliable contact closure
+within the tested training budget.
+Qualitative analysis of the reward function reveals that the
+step penalty and contact-bonus structure present conflicting
+incentives, which are discussed alongside directions for future work.
+
+\end{abstract}
+
+% IEEE keywords
+\begin{IEEEkeywords}
+reinforcement learning, robotic manipulation, Soft Actor-Critic,
+MuJoCo, reward shaping, SO-100 robot arm, Gymnasium
+\end{IEEEkeywords}
+
+
+% ============================================================
+\section{Introduction}
+\label{sec:introduction}
+% ============================================================
+
+Robotic manipulation is one of the most challenging open problems in
+autonomous systems research.
+Even tasks that are trivial for humans—reaching for an object,
+grasping it, and moving it to a target location—require a robot to
+solve a high-dimensional continuous control problem under physical
+constraints and sensory uncertainty \cite{todorov2012mujoco}.
+
+Reinforcement learning offers a promising framework for robot
+control: rather than hand-coding a controller for every possible
+configuration, the agent learns a policy by interacting with the
+environment and maximising cumulative reward \cite{sutton2018rl}.
+Recent advances in off-policy algorithms, particularly
+Soft Actor-Critic (SAC) \cite{haarnoja2018sac}, have demonstrated
+impressive results on continuous-action robotic benchmarks.
+
+This project applies these ideas to the SO-100 robot arm
+\cite{gymso100}, a six-joint manipulator originally designed for
+teleoperation tasks.
+Using MuJoCo as the physics backend and the \texttt{gym-so100}
+package as the environment interface, we train an SAC agent to
+perform three manipulation tasks of increasing complexity.
+
+\subsection{Motivation}
+
+The SO-100 arm is a low-cost, open-source manipulator platform.
+Developing RL-based controllers for it bridges the gap between
+academic RL research and practical, affordable robotics.
+This project is intended to serve as a reproducible baseline
+demonstrating what 300\,000 training steps of SAC can achieve on
+this hardware.
+
+\subsection{Contributions}
+
+The main contributions of this work are:
+\begin{itemize}
+    \item A fully configured RL training pipeline for the SO-100
+          arm using SAC and Stable Baselines 3.
+    \item A reward function analysis identifying the cause of
+          incomplete contact learning.
+    \item An interactive visualisation and reward-probe toolkit
+          for diagnosing agent behaviour.
+    \item Recommendations for reward redesign and extended training.
+\end{itemize}
+
+
+% ============================================================
+\section{Problem Statement}
+\label{sec:problem}
+% ============================================================
+
+\subsection{Task Definition}
+
+We define the manipulation problem as a Markov Decision Process
+(MDP) $\mathcal{M} = (\mathcal{S}, \mathcal{A}, \mathcal{R},
+\mathcal{P}, \gamma)$, where:
+
+\begin{itemize}
+    \item $\mathcal{S} \subset \mathbb{R}^{12}$ is the state space,
+    \item $\mathcal{A} = [-1,1]^6$ is the continuous action space,
+    \item $\mathcal{R}: \mathcal{S} \times \mathcal{A} \to \mathbb{R}$
+          is the reward function defined in Section~\ref{sec:reward},
+    \item $\mathcal{P}$ is the transition dynamics governed by
+          MuJoCo physics at 50~Hz,
+    \item $\gamma = 0.99$ is the discount factor.
+\end{itemize}
+
+\subsection{State Observation}
+
+At each timestep $t$, the agent receives a 12-dimensional
+observation vector:
+\begin{equation}
+    \mathbf{s}_t = \bigl[
+        \mathbf{p}_\text{cube},\;
+        \mathbf{p}_\text{bin},\;
+        \mathbf{p}_\text{ee},\;
+        \mathbf{q}
+    \bigr] \in \mathbb{R}^{12}
+    \label{eq:obs}
+\end{equation}
+where $\mathbf{p}_\text{cube}, \mathbf{p}_\text{bin},
+\mathbf{p}_\text{ee} \in \mathbb{R}^3$ are the 3-D Cartesian
+positions of the cube, bin centre, and end-effector respectively,
+and $\mathbf{q} \in \mathbb{R}^6$ contains the current joint angles.
+
+\subsection{Action Space}
+
+The action $\mathbf{a}_t \in [-1,1]^6$ is a normalised joint
+position command.
+Before being sent to the simulator, each component is
+un-normalised to the real joint range:
+
+\begin{table}[h]
+    \centering
+    \caption{Joint Ranges and Normalisation}
+    \label{tab:joints}
+    \begin{tabular}{llrr}
+        \toprule
+        Index & Joint & Min (rad) & Max (rad) \\
+        \midrule
+        0 & Waist          & $-1.92$ & $+1.92$ \\
+        1 & Shoulder       & $-3.32$ & $+0.174$ \\
+        2 & Elbow          & $-0.174$ & $+3.14$ \\
+        3 & Forearm Roll   & $-1.66$ & $+1.66$ \\
+        4 & Wrist Rotate   & $-2.79$ & $+2.79$ \\
+        5 & Gripper        & $-0.174$ & $+1.75$ \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+\subsection{Episode Structure}
+
+Each episode begins with the arm at a fixed home pose and the cube
+spawned at a uniformly random position within:
+$x \in [-0.25, -0.15]$~m, $y \in [0.30, 0.60]$~m, $z = 0.05$~m.
+An episode terminates either on success (reward = 4) or after
+300 steps ($T = 6$~seconds of simulated time).
+
+
+% ============================================================
+\section{Approaches and Solutions}
+\label{sec:approach}
+% ============================================================
+
+\subsection{Environment Architecture}
+
+The environment stack is illustrated in Fig.~\ref{fig:env_stack}.
+
+%% ── HOW TO INSERT A FIGURE ──────────────────────────────────
+%%  1. Place your image in report/figures/env_stack.png
+%%  2. Uncomment the block below
+%%
+% \begin{figure}[h]
+%     \centering
+%     \includegraphics[width=\columnwidth]{figures/env_stack.png}
+%     \caption{Environment architecture: MuJoCo physics wrapped by
+%              dm\_control, then by SO100Env (Gymnasium), then by
+%              VecNormalize and SubprocVecEnv for parallel training.}
+%     \label{fig:env_stack}
+% \end{figure}
+
+The layered design separates concerns cleanly:
+\begin{enumerate}
+    \item \textbf{MuJoCo / dm\_control} simulates rigid-body physics
+          at 50~Hz.
+    \item \textbf{SO100Env} (Gymnasium wrapper) exposes the
+          standard \texttt{reset()} / \texttt{step()} interface and
+          formats observations.
+    \item \textbf{SubprocVecEnv} runs $N=4$ independent environment
+          copies in separate processes, multiplying experience throughput.
+    \item \textbf{VecNormalize} maintains a running mean and standard
+          deviation of observations and normalises them to
+          approximately $\mathcal{N}(0,1)$ before the policy network
+          sees them.
+\end{enumerate}
+
+\subsection{Reward Function}
+\label{sec:reward}
+
+The reward function used in the \texttt{SO100TouchCubeTask} is a
+shaped dense reward consisting of four components:
+
+\subsubsection{Distance Shaping}
+
+Let $d_t = \|\mathbf{p}_\text{ee} - \mathbf{p}_\text{cube}\|_2$
+be the end-effector-to-cube Euclidean distance at step $t$.
+The shaping term is:
+\begin{equation}
+    r_\text{shape}(d) =
+    \max \left(
+        0.1\!\left(1-\tfrac{d}{0.7}\right),\;
+        0.2\!\left(1-\tfrac{d}{0.5}\right),\;
+        0.5\!\left(1-\tfrac{d}{0.3}\right),\;
+        1.0\!\left(1-\tfrac{d}{0.1}\right),\;
+        2.0\!\left(1-\tfrac{d}{0.05}\right)
+    \right)
+    \label{eq:shape}
+\end{equation}
+saturated at $r_\text{shape} = 0$ when $d \geq 0.7$.
+
+\subsubsection{Contact Bonus}
+
+A binary contact bonus is awarded when any gripper pad geometry
+makes physical contact with the cube geometry:
+\begin{equation}
+    r_\text{contact} = \mathbf{1}[\text{touch\_gripper}] \times 1.0
+\end{equation}
+
+\subsubsection{Step Penalty}
+
+A constant penalty of $-0.2$ is applied every timestep to
+encourage faster task completion.
+
+\subsubsection{Success Return}
+
+If the gripper is touching the cube and $d < 0.05$~m simultaneously,
+the episode is terminated and a terminal reward of $+4.0$ is issued.
+
+The total step reward is therefore:
+\begin{equation}
+    r_t =
+    \begin{cases}
+        4.0 & \text{if touch\_gripper} \wedge d < 0.05 \\
+        r_\text{shape}(d_t) + r_\text{contact} - 0.2 & \text{otherwise}
+    \end{cases}
+    \label{eq:reward}
+\end{equation}
+
+\subsection{Policy: Soft Actor-Critic}
+
+SAC \cite{haarnoja2018sac} is an off-policy actor-critic algorithm
+that maximises a maximum-entropy objective:
+\begin{equation}
+    J(\pi) = \sum_{t=0}^{T}
+    \mathbb{E}_{(\mathbf{s}_t,\mathbf{a}_t)\sim\rho_\pi}
+    \!\left[ r(\mathbf{s}_t, \mathbf{a}_t)
+    + \alpha\,\mathcal{H}(\pi(\cdot|\mathbf{s}_t)) \right]
+\end{equation}
+where $\alpha$ is the automatically-tuned entropy coefficient and
+$\mathcal{H}$ is the policy entropy.
+
+Both the actor and twin-critic networks are fully connected MLPs
+with architecture $12 \to 256 \to 256 \to \cdot$
+(Table~\ref{tab:hyperparams}).
+
+\begin{table}[h]
+    \centering
+    \caption{SAC Hyperparameters}
+    \label{tab:hyperparams}
+    \begin{tabular}{ll}
+        \toprule
+        Hyperparameter & Value \\
+        \midrule
+        Network architecture   & $[256, 256]$ MLP \\
+        Learning rate          & $3 \times 10^{-4}$ \\
+        Replay buffer size     & 100\,000 \\
+        Batch size             & 256 \\
+        Entropy coeff.\ $\alpha$ & auto-tuned \\
+        Discount $\gamma$      & 0.99 \\
+        Learning starts        & 1\,000 steps \\
+        Parallel environments  & 4 \\
+        Total training steps   & 300\,000 \\
+        Observation type       & State (12-dim) \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+
+% ============================================================
+\section{Testing and Validation}
+\label{sec:testing}
+% ============================================================
+
+\subsection{Training Curves}
+
+%% ── HOW TO INSERT SIDE-BY-SIDE FIGURES ──────────────────────
+%%  Place images in report/figures/ and uncomment:
+%%
+% \begin{figure}[h]
+%     \centering
+%     \begin{subfigure}[b]{0.48\columnwidth}
+%         \includegraphics[width=\textwidth]{figures/ep_rew_mean.png}
+%         \caption{Mean episode reward}
+%         \label{fig:rew}
+%     \end{subfigure}
+%     \hfill
+%     \begin{subfigure}[b]{0.48\columnwidth}
+%         \includegraphics[width=\textwidth]{figures/ent_coef.png}
+%         \caption{Entropy coefficient}
+%         \label{fig:ent}
+%     \end{subfigure}
+%     \caption{TensorBoard training curves over 300\,000 steps.}
+%     \label{fig:curves}
+% \end{figure}
+
+Training was monitored via TensorBoard.
+The mean episode reward increased steadily from approximately
+$-60$ at the start of training (random policy) to a peak of
+\todo{insert peak value} around step \todo{insert step}.
+The entropy coefficient $\alpha$ decreased monotonically from
+$\approx 1.0$ to $\approx 0.2$, indicating a transition from
+broad exploration to more deterministic exploitation.
+
+\subsection{Quantitative Evaluation}
+
+After training, the final policy was evaluated over 10 episodes
+with deterministic action selection.
+Results are summarised in Table~\ref{tab:eval}.
+
+\begin{table}[h]
+    \centering
+    \caption{Evaluation Results (300\,000 steps, deterministic policy)}
+    \label{tab:eval}
+    \begin{tabular}{lrr}
+        \toprule
+        Metric & Mean & Std \\
+        \midrule
+        Episode reward          & \todo{val} & \todo{val} \\
+        Episode length (steps)  & \todo{val} & \todo{val} \\
+        Success rate (\%)       & \todo{val} & —          \\
+        Min EE-cube distance (m)& \todo{val} & \todo{val} \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+\subsection{Qualitative Behaviour}
+
+Trajectory analysis of the deterministic policy across three
+episodes revealed the following behaviour pattern:
+
+\begin{enumerate}
+    \item The agent consistently reduces the end-effector-to-cube
+          distance from $\approx 0.19$~m to $\approx 0.03$~m within
+          the first 15--40 steps.
+    \item The arm then oscillates around the cube without closing
+          the gripper, collecting the distance-shaping reward
+          indefinitely.
+    \item No contact events (\texttt{touch\_gripper = True}) are
+          observed in any of the three evaluation episodes.
+\end{enumerate}
+
+\subsection{Reward Probe Analysis}
+
+An interactive reward-probe tool was developed to inspect the
+reward signal in real time during manual control.
+This confirmed that the distance-shaping component provides a
+strong, smooth gradient toward the cube, while the contact bonus
+remains latent — the agent never discovers it within the training
+budget because random exploration rarely produces a gripper-closing
+motion precisely when already within $0.05$~m of the cube.
+
+\subsection{Checkpoint Comparison}
+
+\todo{Compare 3 checkpoints (e.g.\ 30k, 150k, 300k steps) and
+describe the improvement in behaviour between them.}
+
+
+% ============================================================
+\section{Future Aspects}
+\label{sec:future}
+% ============================================================
+
+\subsection{Reward Redesign}
+
+The current reward function contains two conflicting pressures
+when $d < 0.05$~m: the step penalty ($-0.2$) discourages staying
+near the cube, while the contact bonus ($+1.0$) only fires on
+actual physical contact.
+Proposed modifications include:
+\begin{itemize}
+    \item Adding an explicit gripper-closing reward term when
+          $d < 0.05$~m, proportional to the gripper joint position.
+    \item Increasing the contact bonus from $+1.0$ to $+3.0$ to
+          make it a dominant signal worth exploring for.
+    \item Removing or reducing the step penalty to allow the agent
+          more time near the cube without negative reinforcement.
+\end{itemize}
+
+\subsection{Extended Training}
+
+Training for 1\,000\,000 steps (approximately $3\times$ longer)
+may allow the agent to stumble upon contact events during
+exploration and subsequently reinforce this behaviour.
+GPU-accelerated training would make this feasible within a
+reasonable time budget.
+
+\subsection{Curriculum Learning}
+
+A curriculum could progressively increase task difficulty:
+spawn the cube directly under the gripper initially, then
+gradually increase randomness in the cube's initial position.
+This would allow the agent to first learn contact closure, then
+learn to approach from a distance.
+
+\subsection{Harder Tasks}
+
+Once contact is mastered, the natural progression is:
+\begin{enumerate}
+    \item \textbf{Lift:} reward the agent for raising the cube
+          above the table.
+    \item \textbf{Place:} reward the agent for depositing the
+          cube in the target bin (\texttt{SO100CubeToBin-v0}).
+    \item \textbf{Pixel observations:} replace the 12-number
+          state vector with a camera image for a more realistic
+          and challenging setting.
+\end{enumerate}
+
+\subsection{Sim-to-Real Transfer}
+
+The ultimate goal is to transfer the learned policy from simulation
+to the physical SO-100 arm.
+Domain randomisation (varying object masses, friction, and cube
+positions during training) and a more faithful sensor model would
+improve transfer fidelity.
+
+
+% ============================================================
+\section{Conclusion}
+\label{sec:conclusion}
+% ============================================================
+
+This project demonstrated the end-to-end application of the
+Soft Actor-Critic algorithm to robotic manipulation of the SO-100
+arm in a MuJoCo simulation environment.
+A complete training and evaluation pipeline was built from scratch,
+including environment configuration, reward function design,
+parallel training, checkpoint management, and interactive
+visualisation tools.
+
+The trained agent exhibits learned approach behaviour—reliably
+reducing the end-effector-to-cube distance to within 3~cm—but does
+not yet achieve consistent contact, indicating that 300\,000 steps
+with the current reward structure is insufficient to bridge the
+final gap between approach and grasp.
+
+Reward function analysis identified the root cause: the contact
+bonus is too weak relative to the distance shaping, and the step
+penalty discourages the persistent near-object exploration needed
+to discover the contact signal.
+Targeted reward modifications and extended training are expected
+to resolve this in future work.
+
+
+% ============================================================
+%  REFERENCES
+% ============================================================
+\bibliographystyle{IEEEtran}
+
+%% ── HOW TO USE REFERENCES ───────────────────────────────────
+%%  Option A (BibTeX — recommended):
+%%    1. Create report/references.bib with your entries
+%%    2. Uncomment the line below:
+% \bibliography{references}
+
+%%  Option B (inline — no .bib file needed):
+%%    Keep the thebibliography block below as-is and add entries.
+
+\begin{thebibliography}{9}
+
+\bibitem{todorov2012mujoco}
+E.~Todorov, T.~Erez, and Y.~Tassa,
+``MuJoCo: A physics engine for model-based control,''
+in \emph{Proc.\ IEEE/RSJ Int.\ Conf.\ Intelligent Robots and Systems
+(IROS)}, 2012, pp.~5026--5033.
+
+\bibitem{sutton2018rl}
+R.~S.~Sutton and A.~G.~Barto,
+\emph{Reinforcement Learning: An Introduction}, 2nd~ed.
+Cambridge, MA: MIT Press, 2018.
+
+\bibitem{haarnoja2018sac}
+T.~Haarnoja, A.~Zhou, P.~Abbeel, and S.~Levine,
+``Soft Actor-Critic: Off-policy maximum entropy deep reinforcement
+learning with a stochastic actor,''
+in \emph{Proc.\ Int.\ Conf.\ Machine Learning (ICML)}, 2018,
+pp.~1861--1870.
+
+\bibitem{gymso100}
+I.~Julczuk,
+``gym-so100-c: A Gymnasium environment for the SO-100 robot arm,''
+2024. [Online]. Available: \url{https://github.com/ilonajulczuk/gym-so100-c}
+
+\bibitem{sb3}
+A.~Raffin \emph{et al.},
+``Stable-Baselines3: Reliable Reinforcement Learning Implementations,''
+\emph{J.\ Machine Learning Research}, vol.~22, no.~268, pp.~1--8, 2021.
+
+\bibitem{dmcontrol}
+S.~Tunyasuvunakool \emph{et al.},
+``dm\_control: Software package for physics-based simulation and
+reinforcement learning,''
+\emph{Software Impacts}, vol.~6, p.~100022, 2020.
+
+%% Add more references here following the same \bibitem pattern.
+%% Example:
+% \bibitem{yourkey}
+% A.~Author and B.~Author,
+% ``Title of the paper,''
+% \emph{Journal Name}, vol.~X, no.~Y, pp.~Z1--Z2, Year.
+
+\end{thebibliography}
+
+\end{document}
